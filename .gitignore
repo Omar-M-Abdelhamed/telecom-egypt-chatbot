@@ -2,8 +2,9 @@
 .env
 .streamlit/secrets.toml
 
-# ChromaDB data — re-scraped automatically on Streamlit Cloud
+# Vector store data — re-scraped automatically on Streamlit Cloud
 chroma_db/
+vector_store.pkl
 
 # Python
 __pycache__/

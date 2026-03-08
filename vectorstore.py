@@ -1,191 +1,146 @@
 """
 vectorstore.py
 --------------
-Manages the ChromaDB vector store:
-  - Initialises (or loads) the persistent database from disk
-  - Embeds text using sentence-transformers (free, runs locally)
-  - Adds documents (from the scraper or uploaded files)
-  - Searches for the most relevant chunks given a query
+Pure numpy + sentence-transformers vector store.
+No ChromaDB — eliminates all pydantic/chromadb compatibility issues.
 
-ChromaDB stores its data in ./chroma_db/ by default, so after the first
-run the data persists and we never need to re-scrape.
+Data is persisted to ./vector_store.pkl on disk so scraping only happens once.
 """
 
 import os
+import pickle
 import hashlib
-from typing import Optional
 
-import chromadb
-from chromadb.utils import embedding_functions
+import numpy as np
+from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-CHROMA_PERSIST_DIR = "./chroma_db"          # where ChromaDB saves data
-COLLECTION_NAME    = "telecom_egypt"        # logical bucket inside ChromaDB
-EMBED_MODEL        = "paraphrase-multilingual-MiniLM-L12-v2"  # supports Arabic + English
+PERSIST_PATH = "./vector_store.pkl"
+EMBED_MODEL  = "paraphrase-multilingual-MiniLM-L12-v2"  # Arabic + English
+CHUNK_SIZE    = 800
+CHUNK_OVERLAP = 150
+TOP_K         = 5
 
-# Text chunking settings
-CHUNK_SIZE    = 800   # characters per chunk
-CHUNK_OVERLAP = 150   # overlap between adjacent chunks
+# ── In-memory state ────────────────────────────────────────────────────────────
+_model: SentenceTransformer | None = None
 
-# How many chunks to retrieve per query
-TOP_K = 5
-
-
-# ── Embedding function (sentence-transformers, runs locally) ──────────────────
-def _get_embedding_function():
-    """Return a ChromaDB-compatible embedding function using sentence-transformers."""
-    return embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=EMBED_MODEL
-    )
+# Store shape: {"ids": list, "embeddings": np.ndarray | None, "documents": list, "metadatas": list}
+_store: dict | None = None
 
 
-# ── ChromaDB client & collection ──────────────────────────────────────────────
-_client: Optional[chromadb.ClientAPI] = None
-_collection = None
+def _get_model() -> SentenceTransformer:
+    global _model
+    if _model is None:
+        _model = SentenceTransformer(EMBED_MODEL)
+    return _model
 
 
-def get_collection():
-    """
-    Return the ChromaDB collection, creating it (and the client) if needed.
-    Data is persisted to CHROMA_PERSIST_DIR on disk.
-    """
-    global _client, _collection
-
-    if _collection is not None:
-        return _collection
-
-    os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
-
-    _client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
-    _collection = _client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=_get_embedding_function(),
-        metadata={"hnsw:space": "cosine"},   # cosine similarity
-    )
-    return _collection
+def _load_store() -> dict:
+    global _store
+    if _store is not None:
+        return _store
+    if os.path.exists(PERSIST_PATH):
+        with open(PERSIST_PATH, "rb") as f:
+            _store = pickle.load(f)
+    else:
+        _store = {"ids": [], "embeddings": None, "documents": [], "metadatas": []}
+    return _store
 
 
-# ── Check whether the DB already has data ─────────────────────────────────────
+def _save_store() -> None:
+    with open(PERSIST_PATH, "wb") as f:
+        pickle.dump(_store, f)
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+
 def is_populated() -> bool:
-    """Return True if the collection already contains documents."""
-    col = get_collection()
-    return col.count() > 0
+    return len(_load_store()["ids"]) > 0
 
 
-# ── Text chunking ──────────────────────────────────────────────────────────────
 def _split_text(text: str) -> list[str]:
-    """Split long text into overlapping chunks for better retrieval."""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ".", "،", " ", ""],  # Arabic comma included
+        separators=["\n\n", "\n", ".", "،", " ", ""],
     )
     return splitter.split_text(text)
 
 
-def _make_id(source: str, chunk_index: int) -> str:
-    """Create a stable, unique ID for a chunk (hash of source + index)."""
-    raw = f"{source}::{chunk_index}"
-    return hashlib.md5(raw.encode()).hexdigest()
+def _make_id(source: str, index: int) -> str:
+    return hashlib.md5(f"{source}::{index}".encode()).hexdigest()
 
 
-# ── Add documents ──────────────────────────────────────────────────────────────
 def add_documents(pages: list[dict], verbose: bool = True) -> int:
-    """
-    Embed and store a list of pages in ChromaDB.
+    """Embed and persist a list of {"url"|"filename": str, "text": str} dicts."""
+    store = _load_store()
+    model = _get_model()
+    existing_ids = set(store["ids"])
 
-    Parameters
-    ----------
-    pages : list of {"url" | "filename": str, "text": str}
-    verbose : print progress
-
-    Returns
-    -------
-    int : number of chunks actually added
-    """
-    col = get_collection()
-    total_added = 0
+    new_ids, new_docs, new_metas = [], [], []
 
     for page in pages:
         source = page.get("url") or page.get("filename") or "unknown"
         text   = page.get("text", "").strip()
-
         if not text:
             continue
-
-        chunks = _split_text(text)
-
-        ids       = []
-        documents = []
-        metadatas = []
-
-        for i, chunk in enumerate(chunks):
+        for i, chunk in enumerate(_split_text(text)):
             doc_id = _make_id(source, i)
-
-            # Skip chunks already stored (idempotent)
-            existing = col.get(ids=[doc_id])
-            if existing["ids"]:
+            if doc_id in existing_ids:
                 continue
+            new_ids.append(doc_id)
+            new_docs.append(chunk)
+            new_metas.append({"source": source})
 
-            ids.append(doc_id)
-            documents.append(chunk)
-            metadatas.append({"source": source})
+    if new_ids:
+        embeddings = model.encode(new_docs, show_progress_bar=verbose, batch_size=32)
 
-        if ids:
-            col.add(ids=ids, documents=documents, metadatas=metadatas)
-            total_added += len(ids)
-            if verbose:
-                print(f"[VectorStore] Added {len(ids)} chunks from: {source}")
+        store["ids"].extend(new_ids)
+        store["documents"].extend(new_docs)
+        store["metadatas"].extend(new_metas)
+        store["embeddings"] = (
+            embeddings if store["embeddings"] is None
+            else np.vstack([store["embeddings"], embeddings])
+        )
+        _save_store()
 
-    if verbose:
-        print(f"[VectorStore] Total chunks added this session: {total_added}")
-        print(f"[VectorStore] Collection now has {col.count()} chunks total.")
+        if verbose:
+            print(f"[VectorStore] Added {len(new_ids)} chunks. Total: {len(store['ids'])}")
 
-    return total_added
+    return len(new_ids)
 
 
-# ── Search ─────────────────────────────────────────────────────────────────────
 def search(query: str, top_k: int = TOP_K) -> list[dict]:
-    """
-    Find the most relevant chunks for a user query.
-
-    Returns
-    -------
-    list of {"text": str, "source": str, "distance": float}
-    """
-    col = get_collection()
-
-    if col.count() == 0:
+    """Return top-k most similar chunks to the query using cosine similarity."""
+    store = _load_store()
+    if not store["ids"]:
         return []
 
-    results = col.query(
-        query_texts=[query],
-        n_results=min(top_k, col.count()),
-        include=["documents", "metadatas", "distances"],
-    )
+    model = _get_model()
+    q_emb = model.encode([query])                          # shape (1, dim)
 
-    hits = []
-    for doc, meta, dist in zip(
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0],
-    ):
-        hits.append({
-            "text":     doc,
-            "source":   meta.get("source", "unknown"),
-            "distance": round(dist, 4),
-        })
+    embs  = store["embeddings"]                            # shape (n, dim)
+    # Normalise rows for cosine similarity
+    embs_norm = embs  / (np.linalg.norm(embs,  axis=1, keepdims=True) + 1e-10)
+    q_norm    = q_emb / (np.linalg.norm(q_emb, axis=1, keepdims=True) + 1e-10)
 
-    return hits
+    scores = (embs_norm @ q_norm.T).flatten()
+    top_idx = np.argsort(scores)[::-1][:min(top_k, len(scores))]
+
+    return [
+        {
+            "text":     store["documents"][i],
+            "source":   store["metadatas"][i]["source"],
+            "distance": float(1 - scores[i]),
+        }
+        for i in top_idx
+    ]
 
 
-# ── Delete a source ────────────────────────────────────────────────────────────
-def delete_source(source: str) -> int:
-    """Remove all chunks that came from a particular source URL or filename."""
-    col = get_collection()
-    results = col.get(where={"source": source})
-    ids = results.get("ids", [])
-    if ids:
-        col.delete(ids=ids)
-    return len(ids)
+def get_collection():
+    """Thin shim so app.py chunk-count display still works."""
+    class _Compat:
+        def count(self):
+            return len(_load_store()["ids"])
+    return _Compat()
