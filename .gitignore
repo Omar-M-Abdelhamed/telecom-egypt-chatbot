@@ -1,0 +1,28 @@
+# Environment & secrets — NEVER commit these
+.env
+.streamlit/secrets.toml
+
+# ChromaDB data — re-scraped automatically on Streamlit Cloud
+chroma_db/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
