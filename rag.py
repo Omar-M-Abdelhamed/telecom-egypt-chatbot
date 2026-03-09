@@ -2,6 +2,7 @@
 rag.py
 ------
 RAG pipeline with multi-turn conversation memory.
+Uses the new google-genai SDK (google.genai) — the old google.generativeai is deprecated.
 
 Flow per message:
   1. Retrieve top-K relevant chunks from ChromaDB (based on latest question)
@@ -12,13 +13,14 @@ Flow per message:
 
 import os
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 import vectorstore
 
 load_dotenv()
 
-# Support both Streamlit Cloud secrets (for deployment) and .env (for local dev)
+# ── API key: Streamlit Cloud secrets first, then .env ─────────────────────────
 def _get_api_key() -> str:
     try:
         import streamlit as st
@@ -37,11 +39,10 @@ if not GEMINI_API_KEY:
         "Get a free key at https://aistudio.google.com/app/apikey"
     )
 
-genai.configure(api_key=GEMINI_API_KEY)
-
+client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_NAME = "gemini-2.5-flash"
 
-# Base system instruction (no context yet — context is injected per turn)
+# ── System instruction ─────────────────────────────────────────────────────────
 _BASE_SYSTEM = """You are a friendly and professional customer-service agent for Telecom Egypt (TE).
 
 Rules:
@@ -59,74 +60,63 @@ def _build_system_with_context(chunks: list[dict]) -> str:
     """Prepend retrieved KB chunks to the system instruction for this turn."""
     if not chunks:
         return _BASE_SYSTEM
-
-    context_parts = []
-    for i, chunk in enumerate(chunks, start=1):
-        context_parts.append(f"[Source {i}: {chunk['source']}]\n{chunk['text']}")
+    context_parts = [
+        f"[Source {i}: {c['source']}]\n{c['text']}"
+        for i, c in enumerate(chunks, start=1)
+    ]
     context_block = "\n\n---\n\n".join(context_parts)
+    return f"{_BASE_SYSTEM}\n\n=== RELEVANT CONTEXT ===\n{context_block}\n{'='*50}"
 
-    return f"{_BASE_SYSTEM}\n\n=== RELEVANT CONTEXT FROM KNOWLEDGE BASE ===\n{context_block}\n{'='*50}"
 
-
-def _to_gemini_history(messages: list[dict]) -> list[dict]:
+def _to_genai_history(messages: list[dict]) -> list[types.Content]:
     """
-    Convert app.py message list → Gemini chat history format.
-    Gemini roles: "user" | "model"
-    Skips the last message (current user turn — sent separately).
+    Convert app.py message list → google.genai Content history.
+    Excludes the last message (current user turn — sent separately).
     """
     history = []
-    # All messages except the last one (which is the current user question)
     for msg in messages[:-1]:
         role = "model" if msg["role"] == "assistant" else "user"
-        history.append({
-            "role": role,
-            "parts": [{"text": msg["content"]}],
-        })
+        history.append(
+            types.Content(role=role, parts=[types.Part(text=msg["content"])])
+        )
     return history
 
 
 def ask_stream(question: str, history: list[dict] = None, top_k: int = 5):
     """
-    Stream a response from Gemini, with full conversation memory.
-
-    Parameters
-    ----------
-    question : the latest user message
-    history  : full message list from st.session_state.messages
-               (list of {"role": "user"|"assistant", "content": str})
-    top_k    : number of KB chunks to retrieve
+    Stream a response from Gemini with full conversation memory.
 
     Yields
     ------
-    (token: str, None)  while streaming
+    (token: str, None)          while streaming
     (None, sources: list[str])  when done
     """
-    # 1. Retrieve context relevant to the latest question
-    chunks = vectorstore.search(question, top_k=top_k)
-    sources = list(dict.fromkeys(chunk["source"] for chunk in chunks))
+    # 1. Retrieve relevant chunks
+    chunks  = vectorstore.search(question, top_k=top_k)
+    sources = list(dict.fromkeys(c["source"] for c in chunks))
 
-    # 2. Build system instruction with injected context
+    # 2. Build system instruction with context
     system_instruction = _build_system_with_context(chunks)
 
-    # 3. Build Gemini chat history from previous turns
-    gemini_history = _to_gemini_history(history or [])
-
-    # 4. Create a fresh chat session with the full history
-    model = genai.GenerativeModel(
-        model_name=MODEL_NAME,
+    # 3. Build generation config
+    config = types.GenerateContentConfig(
         system_instruction=system_instruction,
-        generation_config={
-            "temperature": 0.3,
-            "top_p": 0.9,
-            "max_output_tokens": 1024,
-        },
+        temperature=0.3,
+        top_p=0.9,
+        max_output_tokens=1024,
     )
-    chat = model.start_chat(history=gemini_history)
 
-    # 5. Send the current question and stream the response
-    response = chat.send_message(question, stream=True)
-    for part in response:
-        if part.text:
-            yield part.text, None
+    # 4. Create chat session with prior history
+    gemini_history = _to_genai_history(history or [])
+    chat = client.chats.create(
+        model=MODEL_NAME,
+        config=config,
+        history=gemini_history,
+    )
+
+    # 5. Stream the response
+    for chunk in chat.send_message_stream(question):
+        if chunk.text:
+            yield chunk.text, None
 
     yield None, sources
